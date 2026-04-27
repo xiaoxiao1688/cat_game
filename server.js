@@ -9,7 +9,39 @@ const PORT = Number(process.env.PORT || 4321);
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.join(__dirname, "data");
 const SCORES_FILE = path.join(DATA_DIR, "scores.json");
+const LOCK_FILE = path.join(DATA_DIR, ".scores.lock");
 const MAX_NAME_LENGTH = 20;
+
+const LOCK_TIMEOUT_MS = 5000;
+const LOCK_WAIT_INTERVAL_MS = 100;
+const LOCK_STALE_MS = 30000;
+const SESSION_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const SESSION_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
+const MIN_SESSION_AGE_MS = 1000;
+
+const GAME_CONFIG = {
+  title: "Cat Snack Dash",
+  durationSeconds: 60,
+  maxLives: 3,
+  fishScore: 10,
+  goldenFishScore: 25,
+  bombPenalty: 1,
+  baseSpawnInterval: 800,
+  minSpawnInterval: 300,
+  maxItemsPerSecond: 4,
+  maxComboMultiplier: 2,
+  doubleScoreMultiplier: 2,
+  powerUps: {
+    shield: { name: "Shield", duration: 5000, icon: "SH" },
+    doubleScore: { name: "Double", duration: 8000, icon: "X2" },
+    magnet: { name: "Magnet", duration: 6000, icon: "MG" },
+    slowTime: { name: "Slow", duration: 5000, icon: "SL" }
+  },
+  skills: {
+    dash: { name: "Dash", cooldown: 10000, icon: "D" },
+    clearBombs: { name: "Clear", cooldown: 15000, icon: "C" }
+  }
+};
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -23,6 +55,27 @@ const MIME_TYPES = {
   ".ico": "image/x-icon"
 };
 
+const activeSessions = new Map();
+
+function log(level, message, error) {
+  const prefix = `[${new Date().toISOString()}] [${level}]`;
+  if (error) {
+    console.error(prefix, message, error);
+    return;
+  }
+
+  if (level === "WARN") {
+    console.warn(prefix, message);
+    return;
+  }
+
+  console.log(prefix, message);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function ensureStorage() {
   await fsp.mkdir(DATA_DIR, { recursive: true });
 
@@ -31,6 +84,63 @@ async function ensureStorage() {
   } catch {
     await fsp.writeFile(SCORES_FILE, "[]\n", "utf8");
   }
+
+  await clearStaleLockIfNeeded();
+}
+
+async function clearStaleLockIfNeeded() {
+  try {
+    const raw = await fsp.readFile(LOCK_FILE, "utf8");
+    const createdAt = Number(raw.trim());
+    if (!Number.isFinite(createdAt)) {
+      await fsp.unlink(LOCK_FILE);
+      return;
+    }
+
+    if (Date.now() - createdAt > LOCK_STALE_MS) {
+      log("WARN", "Removing stale score lock");
+      await fsp.unlink(LOCK_FILE);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      log("WARN", "Failed to inspect score lock", error);
+    }
+  }
+}
+
+async function acquireLock() {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < LOCK_TIMEOUT_MS) {
+    try {
+      const handle = await fsp.open(LOCK_FILE, "wx");
+      try {
+        await handle.writeFile(`${Date.now()}\n`, "utf8");
+      } finally {
+        await handle.close();
+      }
+      return true;
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        throw error;
+      }
+
+      await clearStaleLockIfNeeded();
+      await delay(LOCK_WAIT_INTERVAL_MS);
+    }
+  }
+
+  return false;
+}
+
+async function releaseLock() {
+  try {
+    await fsp.unlink(LOCK_FILE);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      log("WARN", "Failed to release score lock", error);
+    }
+  }
 }
 
 async function readScores() {
@@ -38,13 +148,25 @@ async function readScores() {
     const raw = await fsp.readFile(SCORES_FILE, "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
-  } catch {
+  } catch (error) {
+    log("ERROR", "Failed to read scores", error);
     return [];
   }
 }
 
 async function writeScores(scores) {
-  await fsp.writeFile(SCORES_FILE, `${JSON.stringify(scores, null, 2)}\n`, "utf8");
+  const lockAcquired = await acquireLock();
+  if (!lockAcquired) {
+    throw new Error("Failed to acquire score lock");
+  }
+
+  try {
+    const tempPath = `${SCORES_FILE}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(tempPath, `${JSON.stringify(scores, null, 2)}\n`, "utf8");
+    await fsp.rename(tempPath, SCORES_FILE);
+  } finally {
+    await releaseLock();
+  }
 }
 
 function normalizeName(value) {
@@ -63,6 +185,90 @@ function normalizeScore(value) {
   }
 
   return Math.max(0, Math.round(numeric));
+}
+
+function calculateMaxPossibleScore() {
+  const maxItems = GAME_CONFIG.durationSeconds * GAME_CONFIG.maxItemsPerSecond;
+  const maxPerItem =
+    GAME_CONFIG.goldenFishScore *
+    GAME_CONFIG.maxComboMultiplier *
+    GAME_CONFIG.doubleScoreMultiplier;
+
+  return Math.floor(maxItems * maxPerItem);
+}
+
+function createSession() {
+  const sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+  const now = Date.now();
+
+  const session = {
+    id: sessionId,
+    createdAt: now,
+    startedAt: now,
+    lastActivityAt: now,
+    analytics: {
+      itemsCaught: { fish: 0, golden: 0, bomb: 0 },
+      powerUpsUsed: 0
+    }
+  };
+
+  activeSessions.set(sessionId, session);
+  return session;
+}
+
+function closeSession(sessionId) {
+  if (!sessionId) {
+    return;
+  }
+
+  activeSessions.delete(sessionId);
+}
+
+function touchSession(session) {
+  if (session) {
+    session.lastActivityAt = Date.now();
+  }
+}
+
+function cleanExpiredSessions() {
+  const now = Date.now();
+  let removed = 0;
+
+  for (const [sessionId, session] of activeSessions.entries()) {
+    if (now - session.lastActivityAt > SESSION_TIMEOUT_MS) {
+      activeSessions.delete(sessionId);
+      removed += 1;
+    }
+  }
+
+  if (removed > 0) {
+    log("INFO", `Cleaned ${removed} expired sessions`);
+  }
+}
+
+function validateScore(score, session) {
+  if (!session) {
+    return { valid: false, reason: "Session not found" };
+  }
+
+  if (score < 0) {
+    return { valid: false, reason: "Score cannot be negative" };
+  }
+
+  const maxPossibleScore = calculateMaxPossibleScore();
+  if (score > maxPossibleScore) {
+    return {
+      valid: false,
+      reason: `Score exceeds max possible value (${score} > ${maxPossibleScore})`
+    };
+  }
+
+  const ageMs = Date.now() - session.startedAt;
+  if (ageMs < MIN_SESSION_AGE_MS) {
+    return { valid: false, reason: "Session ended too quickly" };
+  }
+
+  return { valid: true };
 }
 
 function buildLeaderboard(scores) {
@@ -123,13 +329,52 @@ async function handleApi(req, res, url) {
 
   if (req.method === "GET" && url.pathname === "/api/game-config") {
     return sendJson(res, 200, {
-      title: "Cat Snack Dash",
-      durationSeconds: 45,
-      maxLives: 3,
-      fishScore: 10,
-      goldenFishScore: 25,
-      bombPenalty: 1
+      ...GAME_CONFIG,
+      maxPossibleScore: calculateMaxPossibleScore()
     });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/session") {
+    const session = createSession();
+    return sendJson(res, 201, { ok: true, sessionId: session.id });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/session/update") {
+    try {
+      const rawBody = await readRequestBody(req);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      const session = activeSessions.get(body.sessionId);
+
+      if (!session) {
+        return sendJson(res, 400, { ok: false, message: "Invalid session" });
+      }
+
+      touchSession(session);
+
+      if (body.updateType === "itemCaught" && session.analytics.itemsCaught[body.itemType] !== undefined) {
+        session.analytics.itemsCaught[body.itemType] += 1;
+      }
+
+      if (body.updateType === "powerUpUsed") {
+        session.analytics.powerUpsUsed += 1;
+      }
+
+      return sendJson(res, 200, { ok: true });
+    } catch (error) {
+      log("ERROR", "Failed to update session analytics", error);
+      return sendJson(res, 400, { ok: false, message: "Invalid session payload" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/session/close") {
+    try {
+      const rawBody = await readRequestBody(req);
+      const body = rawBody ? JSON.parse(rawBody) : {};
+      closeSession(body.sessionId);
+      return sendJson(res, 200, { ok: true });
+    } catch (error) {
+      return sendJson(res, 400, { ok: false, message: "Invalid close payload" });
+    }
   }
 
   if (req.method === "POST" && url.pathname === "/api/score") {
@@ -138,6 +383,17 @@ async function handleApi(req, res, url) {
       const body = rawBody ? JSON.parse(rawBody) : {};
       const name = normalizeName(body.name);
       const score = normalizeScore(body.score);
+      const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+      const session = activeSessions.get(sessionId);
+      const validation = validateScore(score, session);
+
+      if (!validation.valid) {
+        closeSession(sessionId);
+        return sendJson(res, 422, {
+          ok: false,
+          message: validation.reason
+        });
+      }
 
       const scores = await readScores();
       scores.push({
@@ -147,11 +403,15 @@ async function handleApi(req, res, url) {
       });
 
       await writeScores(scores);
+      closeSession(sessionId);
+
       return sendJson(res, 201, {
         ok: true,
+        score,
         leaderboard: buildLeaderboard(scores)
       });
     } catch (error) {
+      log("ERROR", "Failed to submit score", error);
       return sendJson(res, 400, {
         ok: false,
         message: "Invalid score payload"
@@ -167,7 +427,7 @@ function safePathname(pathname) {
   return normalized === path.sep ? "index.html" : normalized.replace(/^[/\\]/, "") || "index.html";
 }
 
-async function serveStatic(req, res, url) {
+async function serveStatic(res, url) {
   const targetPath = safePathname(url.pathname === "/" ? "/index.html" : url.pathname);
   const filePath = path.join(PUBLIC_DIR, targetPath);
 
@@ -194,6 +454,7 @@ async function serveStatic(req, res, url) {
 
 async function createServer() {
   await ensureStorage();
+  setInterval(cleanExpiredSessions, SESSION_CLEANUP_INTERVAL_MS);
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
@@ -206,9 +467,9 @@ async function createServer() {
         }
       }
 
-      await serveStatic(req, res, url);
+      await serveStatic(res, url);
     } catch (error) {
-      console.error(error);
+      log("ERROR", "Unhandled request failure", error);
       sendJson(res, 500, {
         ok: false,
         message: "Internal server error"
@@ -217,7 +478,7 @@ async function createServer() {
   });
 
   server.listen(PORT, HOST, () => {
-    console.log(`Cat Snack Dash is running at http://${HOST}:${PORT}`);
+    log("INFO", `Cat Snack Dash is running at http://${HOST}:${PORT}`);
   });
 }
 
